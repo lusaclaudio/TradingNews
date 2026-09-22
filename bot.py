@@ -96,7 +96,7 @@ def save_state(path, s):
 
 
 # ---------------------------------------------------------------- feed
-def clean(text, n=500):
+def clean(text, n=1500):
     text = re.sub(r"<[^>]+>", " ", text or "")
     text = html.unescape(re.sub(r"\s+", " ", text)).strip()
     return text[:n]
@@ -148,13 +148,16 @@ News nuove (JSON):
 
 Rispondi SOLO con un array JSON, un oggetto per news. Per le news con score < 7 metti solo id e score
 (niente altri campi), per risparmiare. Formato:
-[{{"id":"...","score":8,"titolo":"titolo breve in italiano","cosa":"1-2 frasi in italiano: cosa è successo e perché conta",
+[{{"id":"...","score":8,
+"titolo":"titolo chiaro in italiano",
+"cosa":"3-4 frasi in italiano, comprensibili anche a chi non segue la vicenda: chi ha fatto/detto cosa, con numeri, date e nomi precisi; il contesto essenziale (cosa era successo prima, cosa ci si aspettava). Niente sigle non spiegate.",
+"perche":"1-2 frasi: perché questa news muove i mercati e cosa può succedere dopo",
 "impatto":"asset coinvolti e direzione probabile, es. 'NQ ↓, Oro ↑, USD ↑'"}}]"""
 
 
 def build_prompt(items, sent):
     payload = [{"id": i["id"], "fonte": i["source"], "categoria": i["cat"],
-                "titolo": i["title"], "testo": i["body"][:400]} for i in items]
+                "titolo": i["title"], "testo": i["body"][:1200]} for i in items]
     return PROMPT.format(sent="\n".join("- " + s for s in sent[-20:]) or "(nessuna)",
                          items=json.dumps(payload, ensure_ascii=False))
 
@@ -237,11 +240,14 @@ def send_telegram(token, chat_id, text, dry=False):
 def format_msg(item, ev):
     s = int(ev.get("score", 0))
     icon = "🚨" if s >= 9 else "⚠️"
-    e = html.escape
+    def e(t, quote=False):
+        return html.escape(t, quote=quote)
     lines = [f"{icon} <b>{e(ev.get('titolo') or item['title'])}</b>",
              f"<i>{e(item['cat'])} · {e(item['source'])} · impatto {s}/10</i>"]
     if ev.get("cosa"):
         lines += ["", e(ev["cosa"])]
+    if ev.get("perche"):
+        lines += ["", "💡 <b>Perché conta:</b> " + e(ev["perche"])]
     if ev.get("impatto"):
         lines += ["", "📊 " + e(ev["impatto"])]
     if item["cat"] == "Trump" and not ev.get("cosa") and ev.get("titolo") != item["title"]:
