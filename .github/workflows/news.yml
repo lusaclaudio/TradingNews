@@ -1,0 +1,46 @@
+name: Market News Bot
+
+on:
+  schedule:
+    - cron: "*/20 * * * *"     # parte ogni 20 min, ogni run controlla per ~25 min
+  workflow_dispatch: {}        # avvio manuale dal tab Actions
+
+concurrency:
+  group: news-bot
+  cancel-in-progress: false    # niente run sovrapposti: il successivo aspetta
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Ripristina stato (news già viste)
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: news-state-${{ github.run_id }}
+          restore-keys: news-state-
+
+      - name: Controlla le news
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MIN_SCORE: ${{ vars.MIN_SCORE || '7' }}
+          RUN_MINUTES: "25"
+        run: python bot.py --loop 60
+
+      - name: Salva stato
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: news-state-${{ github.run_id }}
