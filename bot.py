@@ -2,8 +2,8 @@
 """
 Market News Bot — ti scrive su Telegram quando esce una news che può muovere il mercato.
 
-Fonti: Truth Social di Trump, investingLive (ex ForexLive), CNBC, Fed, Google News
-(geopolitica / AI / macro). Le news nuove vengono valutate da un'AI (Google Gemini,
+Fonti: Walter Bloomberg e First Squawk (copie Telegram dei canali X), Truth Social di Trump,
+investingLive (ex ForexLive), Fed. Le news nuove vengono valutate da un'AI (Google Gemini,
 gratis) con uno score 1-10 e riassunte in italiano; sopra la soglia arriva il messaggio.
 
 Uso:
@@ -34,6 +34,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime
 from urllib.parse import quote_plus
 
 import feedparser
@@ -47,19 +48,17 @@ def gnews(q):
             + "&hl=en-US&gl=US&ceid=US:en")
 
 
-# (nome, url, categoria)
+# (nome, url, categoria)  —  "tg:<canale>" = canale Telegram pubblico (letto da t.me/s/<canale>)
 FEEDS = [
+    ("Walter Bloomberg", "tg:WalterBloomberg", "Flash"),
+    ("First Squawk", "tg:firstsquaw", "Flash"),
     ("Trump (Truth Social)", "https://www.trumpstruth.org/feed", "Trump"),
     ("investingLive", "https://investinglive.com/feed/news/", "Mercati"),
     ("investingLive CB", "https://investinglive.com/feed/centralbank/", "Banche centrali"),
-    ("CNBC", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114", "Mercati"),
     ("Federal Reserve", "https://www.federalreserve.gov/feeds/press_all.xml", "Banche centrali"),
-    ("Google News – Guerra", gnews('(war OR missile OR airstrike OR invasion OR ceasefire OR "nuclear") '
-                                  '(Iran OR Israel OR Russia OR Ukraine OR China OR Taiwan OR NATO)'), "Geopolitica"),
-    ("Google News – AI", gnews('(Nvidia OR OpenAI OR Anthropic OR "AI chips" OR "export controls" '
-                               'OR "data center" OR TSMC) (surge OR plunge OR ban OR deal OR announces)'), "AI/Tech"),
-    ("Google News – Macro", gnews('(Fed OR Powell OR tariffs OR CPI OR "jobs report" OR recession '
-                                  'OR "rate cut" OR "rate hike") breaking'), "Macro"),
+    # Fonti tolte perché lente / piene di doppioni (riattivabili togliendo il #):
+    # ("CNBC", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114", "Mercati"),
+    # ("Google News – Guerra", gnews('(war OR missile OR airstrike OR invasion OR ceasefire) (Iran OR Israel OR Russia OR Ukraine OR China OR Taiwan)'), "Geopolitica"),
 ]
 
 # Filtro di riserva se non c'è la API key di Claude
@@ -121,9 +120,44 @@ def similar(a, b, thr=0.45):
     return len(a & b) / min(len(a), len(b)) >= thr and len(a & b) >= 3
 
 
+def fetch_telegram_channel(channel):
+    """Legge gli ultimi post dalla pagina pubblica t.me/s/<canale>. Ritorna (id, testo, ts, link)."""
+    r = requests.get(f"https://t.me/s/{channel}", headers=UA, timeout=20)
+    r.raise_for_status()
+    posts = []
+    for chunk in r.text.split('data-post="')[1:]:
+        pid = chunk.split('"', 1)[0]
+        m_text = re.search(r'<div class="tgme_widget_message_text js-message_text"[^>]*>(.*?)</div>', chunk, re.S)
+        m_time = re.search(r'<time[^>]*datetime="([^"]+)"', chunk)
+        if not m_text or not m_time:
+            continue
+        text = re.sub(r"<br\s*/?>", " ", m_text.group(1))
+        try:
+            ts = datetime.fromisoformat(m_time.group(1)).timestamp()
+        except ValueError:
+            continue
+        posts.append((pid, clean(text), ts, f"https://t.me/{pid}"))
+    if not posts:
+        raise ValueError("nessun post trovato (pagina cambiata o canale chiuso?)")
+    return posts
+
+
 def fetch_all(max_age_min):
     items, now = [], time.time()
     for name, url, cat in FEEDS:
+        if url.startswith("tg:"):
+            try:
+                posts = fetch_telegram_channel(url[3:])
+            except Exception as e:
+                print(f"[warn] {name}: {e}", file=sys.stderr)
+                continue
+            for pid, text, ts, link in posts:
+                if now - ts > max_age_min * 60 or not text:
+                    continue
+                uid = hashlib.sha1((name + pid).encode()).hexdigest()[:16]
+                items.append({"id": uid, "source": name, "cat": cat, "title": text[:300],
+                              "body": text, "link": link, "ts": ts})
+            continue
         try:
             r = requests.get(url, headers=UA, timeout=20)
             r.raise_for_status()
