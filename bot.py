@@ -21,7 +21,7 @@ Variabili d'ambiente:
   CLAUDE_MODEL        default: claude-haiku-4-5
   LLM_INTERVAL        default: 120 (secondi minimi tra due chiamate all'AI, per stare nei limiti gratis)
   MIN_SCORE           default: 7   (soglia 1-10 per ricevere la notifica)
-  MAX_AGE_MIN         default: 120 (ignora news più vecchie di N minuti)
+  MAX_AGE_MIN         default: 20  (ignora news pubblicate più di N minuti fa: solo breaking)
   RUN_MINUTES         default: 0   (con --loop: esce dopo N minuti; 0 = mai)
   STATE_FILE          default: state.json
 """
@@ -81,14 +81,16 @@ def load_state(path):
     except Exception:
         s = {}
     s.setdefault("seen", {})     # id -> timestamp
-    s.setdefault("sent", [])     # ultimi titoli inviati (per evitare doppioni)
+    s.setdefault("sent", [])     # news inviate: {t, titolo, orig, storia}
+    s["sent"] = [x if isinstance(x, dict) else {"t": time.time(), "titolo": x, "orig": x, "storia": ""}
+                 for x in s["sent"]]
     return s
 
 
 def save_state(path, s):
     cutoff = time.time() - 3 * 86400
     s["seen"] = {k: v for k, v in s["seen"].items() if v > cutoff}
-    s["sent"] = s["sent"][-40:]
+    s["sent"] = [x for x in s["sent"] if x.get("t", 0) > time.time() - 24 * 3600][-80:]
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(s, f)
@@ -100,6 +102,23 @@ def clean(text, n=1500):
     text = re.sub(r"<[^>]+>", " ", text or "")
     text = html.unescape(re.sub(r"\s+", " ", text)).strip()
     return text[:n]
+
+
+STOP = set("""the and for with from that this after over into amid says said will would could about their
+have has had been more than what when your just also news live update updates breaking report reports
+della delle degli dopo sulla sullo sono come alla alle nella nelle anche contro""".split())
+
+
+def words(text):
+    return {w for w in re.findall(r"[a-z0-9%$.]+", (text or "").lower())
+            if len(w) >= 3 and w not in STOP}
+
+
+def similar(a, b, thr=0.45):
+    a, b = words(a), words(b)
+    if not a or not b:
+        return False
+    return len(a & b) / min(len(a), len(b)) >= thr and len(a & b) >= 3
 
 
 def fetch_all(max_age_min):
@@ -133,14 +152,20 @@ def fetch_all(max_age_min):
 
 # ---------------------------------------------------------------- valutazione
 PROMPT = """Sei un analista di mercato per un trader di futures (ES, NQ, YM, FDAX, oro, petrolio, EUR/USD).
-Valuta queste news appena uscite. Per ciascuna dai uno "score" 1-10 di impatto IMMEDIATO sui mercati:
+Valuta queste news appena uscite. Il trader vuole solo BREAKING NEWS: fatti nuovi appena accaduti.
+Per ciascuna dai uno "score" 1-10 di impatto IMMEDIATO sui mercati:
 - 9-10: evento che muove tutto (dazi nuovi/annullati, attacco militare importante, decisione Fed a sorpresa, crollo/halt)
 - 7-8: news rilevante che può muovere indici o un settore chiave (AI/semiconduttori, petrolio, bond)
-- 1-6: rumore, opinioni, analisi, notizie già note, post politici senza impatto economico
+- 1-6: rumore, opinioni, analisi, anteprime, riepiloghi ("markets wrap", "what to watch", "why X is moving"),
+  aggiornamenti minori di una storia già nota, post politici senza impatto economico
 Sii SEVERO: il trader vuole poche notifiche, solo quelle che contano.
-Se una news è la stessa storia di una già inviata (lista "già inviate") o di un'altra nel lotto, dai score 1 ai doppioni.
 
-Già inviate di recente:
+DOPPIONI (importantissimo): se una news racconta lo STESSO EVENTO di una già inviata (lista sotto), anche con
+parole diverse, da un'altra fonte o con un dettaglio in più, dai score 1. Dai score alto solo se c'è uno
+sviluppo NUOVO e importante (es. prima "Trump minaccia dazi", poi "Trump firma i dazi" = nuova).
+Se nel lotto più news raccontano lo stesso evento, dai lo score alto solo alla più completa, 1 alle altre.
+
+Già inviate nelle ultime 24 ore:
 {sent}
 
 News nuove (JSON):
@@ -149,6 +174,7 @@ News nuove (JSON):
 Rispondi SOLO con un array JSON, un oggetto per news. Per le news con score < 7 metti solo id e score
 (niente altri campi), per risparmiare. Formato:
 [{{"id":"...","score":8,
+"storia":"4-6 parole chiave in inglese minuscolo che identificano l'evento, es. 'trump china tariffs 100 november'",
 "titolo":"titolo chiaro in italiano",
 "cosa":"3-4 frasi in italiano, comprensibili anche a chi non segue la vicenda: chi ha fatto/detto cosa, con numeri, date e nomi precisi; il contesto essenziale (cosa era successo prima, cosa ci si aspettava). Niente sigle non spiegate.",
 "perche":"1-2 frasi: perché questa news muove i mercati e cosa può succedere dopo",
@@ -158,7 +184,8 @@ Rispondi SOLO con un array JSON, un oggetto per news. Per le news con score < 7 
 def build_prompt(items, sent):
     payload = [{"id": i["id"], "fonte": i["source"], "categoria": i["cat"],
                 "titolo": i["title"], "testo": i["body"][:1200]} for i in items]
-    return PROMPT.format(sent="\n".join("- " + s for s in sent[-20:]) or "(nessuna)",
+    return PROMPT.format(sent="\n".join(f"- {x['titolo']} [{x.get('storia', '')}]" for x in sent[-40:])
+                         or "(nessuna)",
                          items=json.dumps(payload, ensure_ascii=False))
 
 
@@ -243,7 +270,8 @@ def format_msg(item, ev):
     def e(t, quote=False):
         return html.escape(t, quote=quote)
     lines = [f"{icon} <b>{e(ev.get('titolo') or item['title'])}</b>",
-             f"<i>{e(item['cat'])} · {e(item['source'])} · impatto {s}/10</i>"]
+             f"<i>{e(item['cat'])} · {e(item['source'])} · impatto {s}/10 · "
+             f"{max(0, int((time.time() - item['ts']) // 60))} min fa</i>"]
     if ev.get("cosa"):
         lines += ["", e(ev["cosa"])]
     if ev.get("perche"):
@@ -258,53 +286,59 @@ def format_msg(item, ev):
 
 
 # ---------------------------------------------------------------- main
+def is_dup(title, sent):
+    return any(similar(title, x.get("orig", "")) or similar(title, x.get("titolo", "")) for x in sent)
+
+
 def run_once(cfg, state):
     items = fetch_all(cfg["max_age"])
     new = [i for i in items if i["id"] not in state["seen"]]
-    # dedup titoli identici tra fonti diverse
-    uniq, titles = [], set()
-    for i in sorted(new, key=lambda x: x["ts"]):
-        k = re.sub(r"\W+", "", i["title"].lower())[:80]
-        if k not in titles:
-            titles.add(k)
-            uniq.append(i)
-    print(f"[info] {len(items)} news recenti, {len(uniq)} nuove")
+    # 1) doppioni evidenti, senza AI: titolo simile a una news già inviata o già in coda
+    uniq = []
+    for i in sorted(new, key=lambda x: -len(x["body"])):   # tieni la versione più completa
+        if is_dup(i["title"], state["sent"]) or any(similar(i["title"], u["title"]) for u in uniq):
+            state["seen"][i["id"]] = time.time()
+            continue
+        uniq.append(i)
+    print(f"[info] {len(items)} news ultimi {cfg['max_age']} min, {len(uniq)} nuove, "
+          f"{len(state['seen'])} già viste")
     if not uniq:
         return
 
     evals = {}
     use_ai = bool(cfg["gemini_key"] or cfg["api_key"])
-    if use_ai and time.time() - state.get("last_ai", 0) < cfg["ai_interval"]:
-        # troppo presto per un'altra chiamata: le news restano in coda per il prossimo giro
-        # (tranne quelle ferme da troppo, che passano al filtro a parole chiave)
-        stale = [i for i in uniq if time.time() - i["ts"] > 45 * 60]
-        evals.update(score_with_keywords(stale))
-        uniq_ai = []
-    else:
-        uniq_ai = uniq if use_ai else []
-        if not use_ai:
-            evals.update(score_with_keywords(uniq))
-    for n in range(0, len(uniq_ai), 40):        # lotti da 40
-        batch = uniq_ai[n:n + 40]
-        state["last_ai"] = time.time()
-        try:
-            res = score_with_ai(batch, state["sent"], cfg)
-            for i in batch:                      # news ignorate dall'AI = irrilevanti
-                evals[i["id"]] = res.get(i["id"], {"id": i["id"], "score": 0})
-        except Exception as e:
-            print(f"[warn] AI non disponibile: {e}", file=sys.stderr)
-            # riprova al prossimo giro; se la news è vecchia usa le parole chiave
-            evals.update(score_with_keywords([i for i in batch if time.time() - i["ts"] > 45 * 60]))
+    if not use_ai:
+        evals = score_with_keywords(uniq)
+    elif time.time() - state.get("last_ai", 0) >= cfg["ai_interval"]:
+        for n in range(0, len(uniq), 40):        # lotti da 40
+            batch = uniq[n:n + 40]
+            state["last_ai"] = time.time()
+            try:
+                res = score_with_ai(batch, state["sent"], cfg)
+                for i in batch:                  # news ignorate dall'AI = irrilevanti
+                    evals[i["id"]] = res.get(i["id"], {"id": i["id"], "score": 0})
+            except Exception as e:
+                print(f"[warn] AI non disponibile, riprovo al prossimo giro: {e}", file=sys.stderr)
+    # altrimenti: troppo presto per chiamare l'AI, le news restano in coda
 
-    for i in uniq:
-        ev = evals.get(i["id"])
-        if ev is None:           # non valutata: riprova al giro dopo
-            continue
+    # 2) invio: dalla più importante; salta gli eventi già inviati (anche in questo giro)
+    ranked = sorted((i for i in uniq if i["id"] in evals),
+                    key=lambda i: -int(evals[i["id"]].get("score", 0) or 0))
+    for i in ranked:
+        ev = evals[i["id"]]
         state["seen"][i["id"]] = time.time()
-        if int(ev.get("score", 0)) >= cfg["min_score"]:
-            send_telegram(cfg["token"], cfg["chat_id"], format_msg(i, ev), cfg["dry"])
-            state["sent"].append(ev.get("titolo") or i["title"][:150])
-            print(f"[sent] {ev.get('score')}/10 {i['title'][:90]}")
+        score = int(ev.get("score", 0) or 0)
+        if score < cfg["min_score"]:
+            continue
+        storia = ev.get("storia", "")
+        if is_dup(i["title"], state["sent"]) or (storia and any(
+                similar(storia, x.get("storia", ""), 0.6) for x in state["sent"])):
+            print(f"[dup] {i['title'][:90]}")
+            continue
+        send_telegram(cfg["token"], cfg["chat_id"], format_msg(i, ev), cfg["dry"])
+        state["sent"].append({"t": time.time(), "titolo": ev.get("titolo") or i["title"][:150],
+                              "orig": i["title"][:200], "storia": storia})
+        print(f"[sent] {score}/10 {i['title'][:90]}")
 
 
 def main():
@@ -323,7 +357,7 @@ def main():
         "ai_interval": int(os.getenv("LLM_INTERVAL") or "120"),
         "model": os.getenv("CLAUDE_MODEL") or "claude-haiku-4-5",
         "min_score": int(os.getenv("MIN_SCORE") or "7"),
-        "max_age": int(os.getenv("MAX_AGE_MIN", "120")),
+        "max_age": int(os.getenv("MAX_AGE_MIN") or "20"),
         "run_min": float(os.getenv("RUN_MINUTES", "0")),
         "state": os.getenv("STATE_FILE", "state.json"),
         "dry": a.dry_run,
@@ -339,6 +373,7 @@ def main():
         return
 
     state = load_state(cfg["state"])
+    print(f"[info] stato caricato: {len(state['seen'])} news già viste, {len(state['sent'])} inviate nelle ultime 24h")
     start = time.time()
     while True:
         try:
