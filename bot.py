@@ -61,15 +61,30 @@ FEEDS = [
     # ("Google News – Guerra", gnews('(war OR missile OR airstrike OR invasion OR ceasefire) (Iran OR Israel OR Russia OR Ukraine OR China OR Taiwan)'), "Geopolitica"),
 ]
 
-# Filtro di riserva se non c'è la API key di Claude
+# Filtro di riserva a parole chiave: usato se non c'è una chiave AI, o se l'AI è giù (in quel caso
+# passano solo le news con punteggio molto alto). Sono regex su parole intere, testo in minuscolo.
 KEYWORDS = {
-    3: ["tariff", "dazi", "fed ", "powell", "rate cut", "rate hike", "emergency", "invasion",
-        "nuclear", "missile", "strike on", "attack on", "declares war", "ceasefire", "sanction", "export control",
-        "default", "shutdown", "halt", "crash", "plunge", "circuit breaker"],
-    2: ["china", "xi ", "iran", "israel", "russia", "ukraine", "taiwan", "opec", "nvidia",
-        "openai", "anthropic", " oil ", "crude", "cpi", "inflation", "payroll", "jobs report", "recession", "treasury",
-        "stock market", " dow ", "nasdaq", "s&p"],
+    3: [  # eventi che muovono il mercato da soli
+        r"tariffs?", r"sanctions?", r"export controls?", r"embargo",
+        r"fomc", r"warsh", r"rate (cut|hike)s?", r"(cut|cuts|hike|hikes|raise|raises|lower|lowers) (interest )?rates?", r"emergency (meeting|cut)",
+        r"invasion", r"invades?", r"declares? war", r"nuclear", r"missiles?", r"air ?strikes?", r"(strike|attack)s? on",
+        r"ceasefire", r"truce", r"blockade", r"hormuz",
+        r"shutdown", r"debt ceiling", r"downgrades?", r"defaults? on",
+        r"trading halt", r"halts? trading", r"circuit breaker", r"crash(es)?", r"plunges?", r"soars?",
+        r"nonfarm", r"payrolls?", r"cpi", r"pce", r"gdp",
+    ],
+    2: [  # attori e temi importanti, contano solo in combinazione
+        r"trump", r"white house", r"xi", r"putin", r"netanyahu", r"khamenei",
+        r"fed", r"powell", r"ecb", r"lagarde", r"boj", r"ueda", r"pboc", r"treasury", r"bessent",
+        r"china", r"chinese", r"iran", r"israel", r"russia", r"ukraine", r"taiwan", r"north korea", r"houthis?", r"red sea",
+        r"opec\+?", r"oil", r"crude", r"brent", r"wti", r"gold", r"yields?", r"10-year", r"bonds?",
+        r"inflation", r"jobs report", r"unemployment", r"jobless claims", r"retail sales", r"ism", r"recession",
+        r"nvidia", r"tsmc", r"openai", r"anthropic", r"microsoft", r"apple", r"alphabet", r"google", r"meta",
+        r"amd", r"broadcom", r"semiconductors?", r"chips?", r"guidance", r"bans?",
+        r"stocks?", r"s&p", r"nasdaq", r"dow", r"futures",
+    ],
 }
+KEYWORDS_RE = {w: [re.compile(r"(?<![a-z0-9])" + k + r"(?![a-z0-9])") for k in ks] for w, ks in KEYWORDS.items()}
 
 
 # ---------------------------------------------------------------- stato
@@ -186,7 +201,16 @@ def fetch_all(max_age_min):
 
 
 # ---------------------------------------------------------------- valutazione
-PROMPT = """Sei un analista di mercato per un trader di futures (ES, NQ, YM, FDAX, oro, petrolio, EUR/USD).
+# Contesto attuale da tenere aggiornato: l'AI può avere conoscenze vecchie sui ruoli delle persone.
+CONTESTO = """- Presidente della Fed: Kevin Warsh (in carica dal 22 maggio 2026). Jerome Powell non è più presidente,
+  resta solo membro del board: le sue parole contano molto meno.
+- Presidente della BCE: Christine Lagarde (ha annunciato che lascerà nel 2027).
+- Presidente USA: Donald Trump."""
+
+PROMPT = """Data di oggi: {oggi}. Contesto attuale (più aggiornato delle tue conoscenze):
+{contesto}
+
+Sei un analista di mercato per un trader di futures (ES, NQ, YM, FDAX, oro, petrolio, EUR/USD).
 Valuta queste news appena uscite. Il trader vuole solo BREAKING NEWS: fatti nuovi appena accaduti.
 Per ciascuna dai uno "score" 1-10 di impatto IMMEDIATO sui mercati:
 - 9-10: evento che muove tutto (dazi nuovi/annullati, attacco militare importante, decisione Fed a sorpresa, crollo/halt,
@@ -224,7 +248,7 @@ Rispondi SOLO con un array JSON, un oggetto per news. Per le news con score < 7 
 def build_prompt(items, sent):
     payload = [{"id": i["id"], "fonte": i["source"], "categoria": i["cat"],
                 "titolo": i["title"], "testo": i["body"][:1200]} for i in items]
-    return PROMPT.format(sent="\n".join(f"- {x['titolo']} [{x.get('storia', '')}]" for x in sent[-40:])
+    return PROMPT.format(oggi=time.strftime("%d/%m/%Y"), contesto=CONTESTO, sent="\n".join(f"- {x['titolo']} [{x.get('storia', '')}]" for x in sent[-40:])
                          or "(nessuna)",
                          items=json.dumps(payload, ensure_ascii=False))
 
@@ -280,15 +304,15 @@ def score_with_ai(items, sent, cfg):
     return parse_json_list(ask_claude(prompt, cfg["api_key"], cfg["model"]))
 
 
-def score_with_keywords(items):
+def score_with_keywords(items, fallback=False):
     out = {}
     for i in items:
-        t = " " + (i["title"] + " " + i["body"]).lower() + " "
-        s = sum(w for w, words in KEYWORDS.items() for k in words if k in t)
+        t = (i["title"] + " " + i["body"]).lower()
+        s = sum(w for w, pats in KEYWORDS_RE.items() for p in pats if p.search(t))
         if i["cat"] == "Trump":
             s += 2
         out[i["id"]] = {"id": i["id"], "score": min(10, 3 + s), "titolo": i["title"],
-                        "cosa": "", "impatto": ""}
+                        "cosa": "", "impatto": "", "riserva": fallback}
     return out
 
 
@@ -320,6 +344,8 @@ def format_msg(item, ev):
         lines += ["", "📊 " + e(ev["impatto"])]
     if item["cat"] == "Trump" and not ev.get("cosa") and ev.get("titolo") != item["title"]:
         lines += ["", "“" + e(item["title"][:500]) + "”"]
+    if ev.get("riserva"):
+        lines += ["", "<i>⚙️ Filtro di riserva: l'AI non era disponibile, nessun riassunto.</i>"]
     if item["link"]:
         lines += ["", f'<a href="{e(item["link"], quote=True)}">Fonte</a>']
     return "\n".join(lines)
@@ -360,7 +386,13 @@ def run_once(cfg, state):
                 for i in batch:                  # news ignorate dall'AI = irrilevanti
                     evals[i["id"]] = res.get(i["id"], {"id": i["id"], "score": 0})
             except Exception as e:
-                print(f"[warn] AI non disponibile, riprovo al prossimo giro: {e}", file=sys.stderr)
+                print(f"[warn] AI non disponibile: {e}", file=sys.stderr)
+                # dopo 5 minuti di attesa usa le parole chiave, ma solo per le news fortissime (>= 9)
+                old = [i for i in batch if time.time() - i["ts"] > 5 * 60]
+                for k, v in score_with_keywords(old, fallback=True).items():
+                    if v["score"] < 9:
+                        v["score"] = 0
+                    evals[k] = v
     else:
         print(f"[info] AI in pausa ({cfg['ai_interval']}s tra chiamate), {len(uniq)} news in coda")
 
