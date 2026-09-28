@@ -260,13 +260,39 @@ def parse_json_list(text):
     return {str(d["id"]): d for d in json.loads(m.group(0)) if isinstance(d, dict) and "id" in d}
 
 
-GEMINI_FALLBACK = ["gemini-flash-lite-latest", "gemini-2.5-flash-lite", "gemini-flash-latest", "gemini-2.5-flash"]
+# Ordine di prova (settembre 2026). Se tutti falliscono, il bot chiede a Google la lista dei modelli attuali.
+GEMINI_FALLBACK = ["gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
+                   "gemini-flash-latest", "gemini-3.8-flash", "gemini-3.5-flash"]
+_discovered = []
+
+
+def discover_gemini_models(api_key):
+    """Modelli Flash di testo disponibili per questa chiave, dal più leggero."""
+    try:
+        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                         headers={"x-goog-api-key": api_key}, params={"pageSize": 200}, timeout=20)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"[warn] lista modelli Gemini non disponibile: {e}", file=sys.stderr)
+        return []
+    out = []
+    for m in r.json().get("models", []):
+        name = m.get("name", "").replace("models/", "")
+        if ("generateContent" in m.get("supportedGenerationMethods", []) and "flash" in name
+                and not re.search(r"image|tts|audio|live|embed|preview|exp|thinking", name)):
+            out.append(name)
+    return sorted(out, key=lambda n: ("lite" not in n, n))
 
 
 def ask_gemini(prompt, api_key, model):
-    models = [model] + [m for m in GEMINI_FALLBACK if m != model]
-    last = None
-    for m in models:
+    tried, last = [], None
+    queue = [model] + [m for m in GEMINI_FALLBACK if m != model] + _discovered
+    discovered = bool(_discovered)
+    while queue:
+        m = queue.pop(0)
+        if m in tried:
+            continue
+        tried.append(m)
         r = requests.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
             headers={"x-goog-api-key": api_key, "content-type": "application/json"},
@@ -274,19 +300,22 @@ def ask_gemini(prompt, api_key, model):
                   "generationConfig": {"temperature": 0.2,
                                        "responseMimeType": "application/json"}},
             timeout=90)
-        if r.status_code == 404:          # modello non più disponibile: prova il prossimo
-            last = f"modello {m} non trovato"
-            continue
-        if r.status_code in (429, 500, 503):   # sovraccarico o quota finita: prova il prossimo modello
-            last = f"{m} {r.status_code} (sovraccarico/quota)"
-            print(f"[info] Gemini {m} risponde {r.status_code}, provo un altro modello", file=sys.stderr)
-            time.sleep(2)
+        if r.status_code in (404, 429, 500, 503):
+            last = f"{m}: {r.status_code}"
+            why = "non disponibile" if r.status_code == 404 else "sovraccarico/quota"
+            print(f"[info] Gemini {m} {why} ({r.status_code}), provo un altro modello", file=sys.stderr)
+            if r.status_code != 404:
+                time.sleep(2)
+            if not queue and not discovered:      # finiti: chiedi a Google quali modelli esistono
+                discovered = True
+                _discovered[:] = discover_gemini_models(api_key)
+                queue += [x for x in _discovered if x not in tried][:4]
             continue
         if not r.ok:
             raise RuntimeError(f"Gemini {r.status_code}: {r.text[:300]}")
         parts = r.json()["candidates"][0]["content"]["parts"]
         return "".join(p.get("text", "") for p in parts)
-    raise RuntimeError(last)
+    raise RuntimeError(f"nessun modello Gemini disponibile (ultimo: {last})")
 
 
 def ask_claude(prompt, api_key, model):
