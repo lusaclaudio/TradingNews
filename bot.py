@@ -17,7 +17,8 @@ Variabili d'ambiente:
   TELEGRAM_CHAT_ID    (obbligatoria) il tuo chat id
   GEMINI_API_KEY      (consigliata, gratis da aistudio.google.com) senza: filtro a parole chiave
   GEMINI_MODEL        default: gemini-flash-lite-latest
-  ANTHROPIC_API_KEY   (facoltativa, a pagamento) usata solo se non c'è GEMINI_API_KEY
+  GROQ_API_KEY        (facoltativa, gratis da console.groq.com) riserva se Gemini è sovraccarico
+  ANTHROPIC_API_KEY   (facoltativa, a pagamento) ultima riserva
   CLAUDE_MODEL        default: claude-haiku-4-5
   LLM_INTERVAL        default: 120 (secondi minimi tra due chiamate all'AI, per stare nei limiti gratis)
   MIN_SCORE           default: 8   (soglia 1-10 per ricevere la notifica)
@@ -143,7 +144,7 @@ def fetch_telegram_channel(channel):
     posts = []
     for chunk in r.text.split('data-post="')[1:]:
         pid = chunk.split('"', 1)[0]
-        m_text = re.search(r'<div class="tgme_widget_message_text js-message_text"[^>]*>(.*?)</div>', chunk, re.S)
+        m_text = re.search(r'<div class="tgme_widget_message_text js-message_text[^"]*"[^>]*>(.*?)</div>', chunk, re.S)
         m_time = re.search(r'<time[^>]*datetime="([^"]+)"', chunk)
         if not m_text or not m_time:
             continue
@@ -158,6 +159,9 @@ def fetch_telegram_channel(channel):
     return posts
 
 
+_reported = set()
+
+
 def fetch_all(max_age_min):
     items, now = [], time.time()
     for name, url, cat in FEEDS:
@@ -167,6 +171,10 @@ def fetch_all(max_age_min):
             except Exception as e:
                 print(f"[warn] {name}: {e}", file=sys.stderr)
                 continue
+            newest = max(p[2] for p in posts)
+            if name not in _reported:
+                _reported.add(name)
+                print(f"[info] {name}: {len(posts)} post letti, l'ultimo di {int((now - newest) // 60)} min fa")
             for pid, text, ts, link in posts:
                 if now - ts > max_age_min * 60 or not text:
                     continue
@@ -223,13 +231,16 @@ per il loro contenuto, anche se sono brevi.
   aggiornamenti minori di una storia già nota, post politici senza impatto economico
 Sii SEVERO: il trader vuole poche notifiche, solo quelle che contano.
 
-DOPPIONI (importantissimo): se una news racconta lo STESSO EVENTO di una già inviata (lista sotto), anche con
-parole diverse, da un'altra fonte o con un dettaglio in più, dai score 1. Ma lo stesso ARGOMENTO non è lo stesso
-EVENTO: uno sviluppo NUOVO e importante va valutato normalmente (es. prima "Trump minaccia dazi", poi "Trump firma
-i dazi" = nuova; prima "colloqui USA-Iran", poi "USA pronti ad allentare le sanzioni" = nuova).
-Se nel lotto più news raccontano lo stesso evento, dai lo score alto solo alla più completa, 1 alle altre.
+Lo "score" misura SOLO l'importanza della news, NON se è un doppione.
 
-Già inviate nelle ultime 24 ore:
+DOPPIONI: metti "doppione": true solo se la news riporta LO STESSO FATTO di una già inviata (lista sotto, con orario),
+cioè stessa persona, stessa azione, stessi dettagli, solo riscritta o ripresa da un'altra fonte.
+È NUOVA (doppione false) se aggiunge un fatto rilevante: una conferma ufficiale, una cifra, una condizione, una
+reazione, un passo successivo (es. "USA pronti ad allentare sanzioni all'Iran" e poi "Trump offre aiuti economici
+all'Iran in cambio di concessioni nucleari" = nuova). Nel dubbio: false. Meglio un doppione che una news persa.
+Se nel lotto più news riportano lo stesso fatto, doppione false solo alla più completa.
+
+Già inviate nelle ultime 3 ore:
 {sent}
 
 News nuove (JSON):
@@ -237,7 +248,7 @@ News nuove (JSON):
 
 Rispondi SOLO con un array JSON, un oggetto per news. Per le news con score < 7 metti solo id e score
 (niente altri campi), per risparmiare. Formato:
-[{{"id":"...","score":8,
+[{{"id":"...","score":8,"doppione":false,"doppione_di":"se doppione, il titolo della news già inviata",
 "storia":"4-6 parole chiave in inglese minuscolo che identificano l'evento, es. 'trump china tariffs 100 november'",
 "titolo":"titolo chiaro in italiano",
 "cosa":"3-4 frasi in italiano, comprensibili anche a chi non segue la vicenda: chi ha fatto/detto cosa, con numeri, date e nomi precisi; il contesto essenziale (cosa era successo prima, cosa ci si aspettava). Niente sigle non spiegate.",
@@ -248,7 +259,9 @@ Rispondi SOLO con un array JSON, un oggetto per news. Per le news con score < 7 
 def build_prompt(items, sent):
     payload = [{"id": i["id"], "fonte": i["source"], "categoria": i["cat"],
                 "titolo": i["title"], "testo": i["body"][:1200]} for i in items]
-    return PROMPT.format(oggi=time.strftime("%d/%m/%Y"), contesto=CONTESTO, sent="\n".join(f"- {x['titolo']} [{x.get('storia', '')}]" for x in sent[-40:])
+    return PROMPT.format(oggi=time.strftime("%d/%m/%Y"), contesto=CONTESTO, sent="\n".join(
+        f"- {time.strftime('%H:%M', time.gmtime(x['t']))} UTC: {x['titolo']} ({x.get('orig', '')[:120]})"
+        for x in sent if x.get("t", 0) > time.time() - 3 * 3600)
                          or "(nessuna)",
                          items=json.dumps(payload, ensure_ascii=False))
 
@@ -331,11 +344,46 @@ def ask_claude(prompt, api_key, model):
     return "".join(b.get("text", "") for b in r.json()["content"])
 
 
+GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+
+
+def ask_groq(prompt, api_key):
+    last = None
+    for m in GROQ_MODELS:
+        r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+                          headers={"Authorization": f"Bearer {api_key}", "content-type": "application/json"},
+                          json={"model": m, "temperature": 0.2,
+                                "messages": [{"role": "user", "content": prompt}]},
+                          timeout=90)
+        if r.status_code in (404, 429, 500, 503):
+            last = f"{m}: {r.status_code}"
+            print(f"[info] Groq {m} non disponibile ({r.status_code}), provo il prossimo", file=sys.stderr)
+            continue
+        if not r.ok:
+            raise RuntimeError(f"Groq {r.status_code}: {r.text[:300]}")
+        return r.json()["choices"][0]["message"]["content"]
+    raise RuntimeError(f"nessun modello Groq disponibile (ultimo: {last})")
+
+
 def score_with_ai(items, sent, cfg):
+    """Prova i fornitori configurati in ordine: Gemini, Groq, Claude."""
     prompt = build_prompt(items, sent)
+    providers = []
     if cfg["gemini_key"]:
-        return parse_json_list(ask_gemini(prompt, cfg["gemini_key"], cfg["gemini_model"]))
-    return parse_json_list(ask_claude(prompt, cfg["api_key"], cfg["model"]))
+        providers.append(("Gemini", lambda: ask_gemini(prompt, cfg["gemini_key"], cfg["gemini_model"])))
+    if cfg["groq_key"]:
+        providers.append(("Groq", lambda: ask_groq(prompt, cfg["groq_key"])))
+    if cfg["api_key"]:
+        providers.append(("Claude", lambda: ask_claude(prompt, cfg["api_key"], cfg["model"])))
+    errors = []
+    for name, call in providers:
+        try:
+            return parse_json_list(call())
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+            if len(providers) > 1:
+                print(f"[info] {name} non disponibile, passo al prossimo fornitore", file=sys.stderr)
+    raise RuntimeError(" | ".join(errors))
 
 
 def score_with_keywords(items, fallback=False):
@@ -408,7 +456,7 @@ def run_once(cfg, state):
         return
 
     evals = {}
-    use_ai = bool(cfg["gemini_key"] or cfg["api_key"])
+    use_ai = bool(cfg["gemini_key"] or cfg["groq_key"] or cfg["api_key"])
     if not use_ai:
         evals = score_with_keywords(uniq)
     elif time.time() - state.get("last_ai", 0) >= cfg["ai_interval"]:
@@ -443,6 +491,9 @@ def run_once(cfg, state):
         if is_dup(i["title"], state["sent"]):
             print(f"[dup] {i['title'][:90]}")
             continue
+        if ev.get("doppione") is True:
+            print(f"[dup-AI {score}/10] {i['source']}: {i['title'][:90]}  =  {str(ev.get('doppione_di', ''))[:90]}")
+            continue
         send_telegram(cfg["token"], cfg["chat_id"], format_msg(i, ev), cfg["dry"])
         state["sent"].append({"t": time.time(), "titolo": ev.get("titolo") or i["title"][:150],
                               "orig": i["title"][:200], "storia": storia})
@@ -464,6 +515,7 @@ def main():
         "chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
         "gemini_key": os.getenv("GEMINI_API_KEY", ""),
         "gemini_model": os.getenv("GEMINI_MODEL") or "gemini-flash-lite-latest",
+        "groq_key": os.getenv("GROQ_API_KEY", ""),
         "api_key": os.getenv("ANTHROPIC_API_KEY", ""),
         "ai_interval": int(os.getenv("LLM_INTERVAL") or "120"),
         "model": os.getenv("CLAUDE_MODEL") or "claude-haiku-4-5",
@@ -479,7 +531,8 @@ def main():
     if a.test:
         send_telegram(cfg["token"], cfg["chat_id"],
                       "✅ <b>Market News Bot attivo</b>\nFiltro: "
-                      + ("Gemini AI" if cfg["gemini_key"] else "Claude AI" if cfg["api_key"] else "parole chiave")
+                      + (" + ".join(n for n, k in (("Gemini", "gemini_key"), ("Groq", "groq_key"), ("Claude", "api_key")) if cfg[k])
+                         or "parole chiave")
                       + f" · soglia {cfg['min_score']}/10", cfg["dry"])
         return
 
