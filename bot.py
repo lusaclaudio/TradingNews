@@ -421,12 +421,11 @@ def run_once(cfg, state):
                     evals[i["id"]] = res.get(i["id"], {"id": i["id"], "score": 0})
             except Exception as e:
                 print(f"[warn] AI non disponibile: {e}", file=sys.stderr)
-                # dopo 5 minuti di attesa usa le parole chiave, ma solo per le news fortissime (>= 9)
-                old = [i for i in batch if time.time() - i["ts"] > 5 * 60]
-                for k, v in score_with_keywords(old, fallback=True).items():
-                    if v["score"] < 9:
-                        v["score"] = 0
-                    evals[k] = v
+                # le news fortissime (>= 9 con le parole chiave) partono subito senza AI;
+                # le altre restano in coda e riprovano con l'AI finché sono nella finestra MAX_AGE_MIN
+                for k, v in score_with_keywords(batch, fallback=True).items():
+                    if v["score"] >= 9:
+                        evals[k] = v
     else:
         print(f"[info] AI in pausa ({cfg['ai_interval']}s tra chiamate), {len(uniq)} news in coda")
 
