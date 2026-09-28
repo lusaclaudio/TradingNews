@@ -260,7 +260,7 @@ def parse_json_list(text):
     return {str(d["id"]): d for d in json.loads(m.group(0)) if isinstance(d, dict) and "id" in d}
 
 
-GEMINI_FALLBACK = ["gemini-flash-lite-latest", "gemini-2.5-flash-lite", "gemini-flash-latest"]
+GEMINI_FALLBACK = ["gemini-flash-lite-latest", "gemini-2.5-flash-lite", "gemini-flash-latest", "gemini-2.5-flash"]
 
 
 def ask_gemini(prompt, api_key, model):
@@ -276,6 +276,11 @@ def ask_gemini(prompt, api_key, model):
             timeout=90)
         if r.status_code == 404:          # modello non più disponibile: prova il prossimo
             last = f"modello {m} non trovato"
+            continue
+        if r.status_code in (429, 500, 503):   # sovraccarico o quota finita: prova il prossimo modello
+            last = f"{m} {r.status_code} (sovraccarico/quota)"
+            print(f"[info] Gemini {m} risponde {r.status_code}, provo un altro modello", file=sys.stderr)
+            time.sleep(2)
             continue
         if not r.ok:
             raise RuntimeError(f"Gemini {r.status_code}: {r.text[:300]}")
