@@ -20,7 +20,7 @@ Variabili d'ambiente:
   GROQ_API_KEY        (facoltativa, gratis da console.groq.com) riserva se Gemini è sovraccarico
   ANTHROPIC_API_KEY   (facoltativa, a pagamento) ultima riserva
   CLAUDE_MODEL        default: claude-haiku-4-5
-  LLM_INTERVAL        default: 120 (secondi minimi tra due chiamate all'AI, per stare nei limiti gratis)
+  LLM_INTERVAL        default: 0   (secondi minimi tra due chiamate all'AI; 0 = a ogni controllo)
   MIN_SCORE           default: 8   (soglia 1-10 per ricevere la notifica)
   MAX_AGE_MIN         default: 20  (ignora news pubblicate più di N minuti fa: solo breaking)
   RUN_MINUTES         default: 0   (con --loop: esce dopo N minuti; 0 = mai)
@@ -517,7 +517,7 @@ def main():
         "gemini_model": os.getenv("GEMINI_MODEL") or "gemini-flash-lite-latest",
         "groq_key": os.getenv("GROQ_API_KEY", ""),
         "api_key": os.getenv("ANTHROPIC_API_KEY", ""),
-        "ai_interval": int(os.getenv("LLM_INTERVAL") or "120"),
+        "ai_interval": int(os.getenv("LLM_INTERVAL") or "0"),
         "model": os.getenv("CLAUDE_MODEL") or "claude-haiku-4-5",
         "min_score": int(os.getenv("MIN_SCORE") or "8"),
         "max_age": int(os.getenv("MAX_AGE_MIN") or "20"),
