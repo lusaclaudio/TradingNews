@@ -451,6 +451,9 @@ def run_once(cfg, state):
 
 
 def main():
+    # su GitHub Actions l'output non è un terminale: senza questo le righe del log arrivano in ritardo
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
     ap = argparse.ArgumentParser()
     ap.add_argument("--loop", type=int, default=0, help="secondi tra un controllo e l'altro")
     ap.add_argument("--test", action="store_true")
