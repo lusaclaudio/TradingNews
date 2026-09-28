@@ -20,7 +20,7 @@ Variabili d'ambiente:
   ANTHROPIC_API_KEY   (facoltativa, a pagamento) usata solo se non c'è GEMINI_API_KEY
   CLAUDE_MODEL        default: claude-haiku-4-5
   LLM_INTERVAL        default: 120 (secondi minimi tra due chiamate all'AI, per stare nei limiti gratis)
-  MIN_SCORE           default: 7   (soglia 1-10 per ricevere la notifica)
+  MIN_SCORE           default: 8   (soglia 1-10 per ricevere la notifica)
   MAX_AGE_MIN         default: 20  (ignora news pubblicate più di N minuti fa: solo breaking)
   RUN_MINUTES         default: 0   (con --loop: esce dopo N minuti; 0 = mai)
   STATE_FILE          default: state.json
@@ -113,11 +113,12 @@ def words(text):
             if len(w) >= 3 and w not in STOP}
 
 
-def similar(a, b, thr=0.45):
+def similar(a, b, thr=0.7):
+    """True solo per titoli quasi identici (stesso fatto riscritto): il resto lo giudica l'AI."""
     a, b = words(a), words(b)
-    if not a or not b:
+    if len(a) < 3 or len(b) < 3:
         return False
-    return len(a & b) / min(len(a), len(b)) >= thr and len(a & b) >= 3
+    return len(a & b) / len(a | b) >= thr
 
 
 def fetch_telegram_channel(channel):
@@ -188,15 +189,20 @@ def fetch_all(max_age_min):
 PROMPT = """Sei un analista di mercato per un trader di futures (ES, NQ, YM, FDAX, oro, petrolio, EUR/USD).
 Valuta queste news appena uscite. Il trader vuole solo BREAKING NEWS: fatti nuovi appena accaduti.
 Per ciascuna dai uno "score" 1-10 di impatto IMMEDIATO sui mercati:
-- 9-10: evento che muove tutto (dazi nuovi/annullati, attacco militare importante, decisione Fed a sorpresa, crollo/halt)
-- 7-8: news rilevante che può muovere indici o un settore chiave (AI/semiconduttori, petrolio, bond)
+- 9-10: evento che muove tutto (dazi nuovi/annullati, attacco militare importante, decisione Fed a sorpresa, crollo/halt,
+  svolte su guerre/negoziati, es. "US OFFICIAL: TRUMP READY TO EASE IRAN SANCTIONS" = 9)
+- 7-8: news rilevante che può muovere indici o un settore chiave (AI/semiconduttori, petrolio, bond, Stretto di Hormuz,
+  dichiarazioni ufficiali di Casa Bianca/Fed/BCE/governi su dazi, sanzioni, conflitti)
+I titoli in MAIUSCOLO dai canali "Flash" (Walter Bloomberg, First Squawk) sono dichiarazioni appena uscite: valutale
+per il loro contenuto, anche se sono brevi.
 - 1-6: rumore, opinioni, analisi, anteprime, riepiloghi ("markets wrap", "what to watch", "why X is moving"),
   aggiornamenti minori di una storia già nota, post politici senza impatto economico
 Sii SEVERO: il trader vuole poche notifiche, solo quelle che contano.
 
 DOPPIONI (importantissimo): se una news racconta lo STESSO EVENTO di una già inviata (lista sotto), anche con
-parole diverse, da un'altra fonte o con un dettaglio in più, dai score 1. Dai score alto solo se c'è uno
-sviluppo NUOVO e importante (es. prima "Trump minaccia dazi", poi "Trump firma i dazi" = nuova).
+parole diverse, da un'altra fonte o con un dettaglio in più, dai score 1. Ma lo stesso ARGOMENTO non è lo stesso
+EVENTO: uno sviluppo NUOVO e importante va valutato normalmente (es. prima "Trump minaccia dazi", poi "Trump firma
+i dazi" = nuova; prima "colloqui USA-Iran", poi "USA pronti ad allentare le sanzioni" = nuova).
 Se nel lotto più news raccontano lo stesso evento, dai lo score alto solo alla più completa, 1 alle altre.
 
 Già inviate nelle ultime 24 ore:
@@ -321,7 +327,8 @@ def format_msg(item, ev):
 
 # ---------------------------------------------------------------- main
 def is_dup(title, sent):
-    return any(similar(title, x.get("orig", "")) or similar(title, x.get("titolo", "")) for x in sent)
+    recent = [x for x in sent if x.get("t", 0) > time.time() - 6 * 3600]
+    return any(similar(title, x.get("orig", "")) for x in recent)
 
 
 def run_once(cfg, state):
@@ -332,6 +339,7 @@ def run_once(cfg, state):
     for i in sorted(new, key=lambda x: -len(x["body"])):   # tieni la versione più completa
         if is_dup(i["title"], state["sent"]) or any(similar(i["title"], u["title"]) for u in uniq):
             state["seen"][i["id"]] = time.time()
+            print(f"[dup] {i['source']}: {i['title'][:100]}")
             continue
         uniq.append(i)
     print(f"[info] {len(items)} news ultimi {cfg['max_age']} min, {len(uniq)} nuove, "
@@ -353,7 +361,8 @@ def run_once(cfg, state):
                     evals[i["id"]] = res.get(i["id"], {"id": i["id"], "score": 0})
             except Exception as e:
                 print(f"[warn] AI non disponibile, riprovo al prossimo giro: {e}", file=sys.stderr)
-    # altrimenti: troppo presto per chiamare l'AI, le news restano in coda
+    else:
+        print(f"[info] AI in pausa ({cfg['ai_interval']}s tra chiamate), {len(uniq)} news in coda")
 
     # 2) invio: dalla più importante; salta gli eventi già inviati (anche in questo giro)
     ranked = sorted((i for i in uniq if i["id"] in evals),
@@ -363,10 +372,10 @@ def run_once(cfg, state):
         state["seen"][i["id"]] = time.time()
         score = int(ev.get("score", 0) or 0)
         if score < cfg["min_score"]:
+            print(f"[skip {score}/10] {i['source']}: {i['title'][:100]}")
             continue
         storia = ev.get("storia", "")
-        if is_dup(i["title"], state["sent"]) or (storia and any(
-                similar(storia, x.get("storia", ""), 0.6) for x in state["sent"])):
+        if is_dup(i["title"], state["sent"]):
             print(f"[dup] {i['title'][:90]}")
             continue
         send_telegram(cfg["token"], cfg["chat_id"], format_msg(i, ev), cfg["dry"])
@@ -390,7 +399,7 @@ def main():
         "api_key": os.getenv("ANTHROPIC_API_KEY", ""),
         "ai_interval": int(os.getenv("LLM_INTERVAL") or "120"),
         "model": os.getenv("CLAUDE_MODEL") or "claude-haiku-4-5",
-        "min_score": int(os.getenv("MIN_SCORE") or "7"),
+        "min_score": int(os.getenv("MIN_SCORE") or "8"),
         "max_age": int(os.getenv("MAX_AGE_MIN") or "20"),
         "run_min": float(os.getenv("RUN_MINUTES", "0")),
         "state": os.getenv("STATE_FILE", "state.json"),
