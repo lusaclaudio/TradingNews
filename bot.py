@@ -35,8 +35,9 @@ import os
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import quote_plus
+from zoneinfo import ZoneInfo
 
 import feedparser
 import requests
@@ -97,6 +98,7 @@ def load_state(path):
         s = {}
     s.setdefault("seen", {})     # id -> timestamp
     s.setdefault("sent", [])     # news inviate: {t, titolo, orig, storia}
+    s.setdefault("weekend", [])  # news trattenute nella pausa del weekend, per il recap
     s["sent"] = [x if isinstance(x, dict) else {"t": time.time(), "titolo": x, "orig": x, "storia": ""}
                  for x in s["sent"]]
     return s
@@ -106,6 +108,7 @@ def save_state(path, s):
     cutoff = time.time() - 3 * 86400
     s["seen"] = {k: v for k, v in s["seen"].items() if v > cutoff}
     s["sent"] = [x for x in s["sent"] if x.get("t", 0) > time.time() - 24 * 3600][-80:]
+    s["weekend"] = [x for x in s.get("weekend", []) if x.get("t", 0) > time.time() - 4 * 86400][-150:]
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(s, f)
@@ -275,7 +278,7 @@ def parse_json_list(text):
 
 # Ordine di prova (settembre 2026). Se tutti falliscono, il bot chiede a Google la lista dei modelli attuali.
 GEMINI_FALLBACK = ["gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
-                   "gemini-flash-latest", "gemini-3.8-flash", "gemini-3.5-flash"]
+                   "gemini-flash-latest", "gemini-3.8-flash", "gemini-3.6-flash"]   # 3.5-flash è stato dismesso
 _discovered = []
 
 
@@ -310,8 +313,7 @@ def ask_gemini(prompt, api_key, model):
             f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
             headers={"x-goog-api-key": api_key, "content-type": "application/json"},
             json={"contents": [{"parts": [{"text": prompt}]}],
-                  "generationConfig": {"temperature": 0.2,
-                                       "responseMimeType": "application/json"}},
+                  "generationConfig": {"responseMimeType": "application/json"}},   # Gemini 3.6: niente temperature
             timeout=90)
         if r.status_code in (404, 429, 500, 503):
             last = f"{m}: {r.status_code}"
@@ -433,6 +435,139 @@ def format_msg(item, ev):
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------- F1
+ROME = ZoneInfo("Europe/Rome")
+F1_URL = "https://api.jolpi.ca/ergast/f1/current.json"
+F1_SESSIONS = [("SprintQualifying", "Sprint Qualifying"), ("Sprint", "Sprint"),
+               ("Qualifying", "Qualifiche"), (None, "Gara")]      # niente prove libere
+F1_REMIND_MIN = 15      # minuti di anticipo del promemoria
+F1_PREVIEW_HOUR = 19    # ora italiana dell'anteprima, il venerdì
+GIORNI = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]
+MESI = ["gen", "feb", "mar", "apr", "mag", "giu", "lug", "ago", "set", "ott", "nov", "dic"]
+
+
+def f1_parse(race):
+    sessions = []
+    for key, label in F1_SESSIONS:
+        d = race if key is None else race.get(key)
+        if not d or not d.get("date") or not d.get("time"):
+            continue
+        try:
+            ts = datetime.fromisoformat(f"{d['date']}T{d['time'].rstrip('Z')}+00:00").timestamp()
+        except ValueError:
+            continue
+        sessions.append({"key": key or "Race", "label": label, "ts": ts})
+    name = (race.get("raceName") or "").replace(" Grand Prix", " GP")
+    return {"id": f"{race.get('season')}-{race.get('round')}", "name": name,
+            "place": race.get("Circuit", {}).get("Location", {}).get("locality", ""),
+            "sessions": sorted(sessions, key=lambda s: s["ts"])}
+
+
+def f1_calendar(state):
+    """Calendario dell'anno in cache nello stato; si aggiorna ogni 12 ore, riprova ogni 30 min se fallisce."""
+    f = state.setdefault("f1", {})
+    now = time.time()
+    if f.get("races") and now - f.get("fetched", 0) < 12 * 3600:
+        return f["races"]
+    if now - f.get("tried", 0) < 1800:
+        return f.get("races", [])
+    f["tried"] = now
+    try:
+        r = requests.get(F1_URL, headers=UA, timeout=20)
+        r.raise_for_status()
+        f["races"] = [f1_parse(x) for x in r.json()["MRData"]["RaceTable"]["Races"]]
+        f["fetched"] = now
+        print(f"[f1] calendario aggiornato: {len(f['races'])} gare")
+    except Exception as e:
+        print(f"[warn] calendario F1 non disponibile: {e}", file=sys.stderr)
+    return f.get("races", [])
+
+
+def f1_check(cfg, state, now=None):
+    now = now or time.time()
+    sent = state.setdefault("f1_sent", [])
+    for race in f1_calendar(state):
+        sess = race["sessions"]
+        if not sess or now > sess[-1]["ts"]:
+            continue
+        # anteprima: venerdì sera (ora italiana) del weekend di gara, solo sessioni ancora da fare
+        sunday = datetime.fromtimestamp(sess[-1]["ts"], ROME).date()
+        friday = sunday - timedelta(days=2)
+        preview_ts = datetime(friday.year, friday.month, friday.day, F1_PREVIEW_HOUR, tzinfo=ROME).timestamp()
+        pkey = race["id"] + ":preview"
+        if now >= preview_ts and pkey not in sent:
+            lines = [f"🏎️ <b>F1 · {html.escape(race['name'])}</b>"
+                     + (f" ({html.escape(race['place'])})" if race["place"] else ""),
+                     "<i>Orari italiani</i>", ""]
+            for s in sess:
+                if s["ts"] > now:
+                    d = datetime.fromtimestamp(s["ts"], ROME)
+                    lines.append(f"{GIORNI[d.weekday()]} {d.day} {MESI[d.month - 1]} · "
+                                 f"<b>{d:%H:%M}</b> {s['label']}")
+            send_telegram(cfg["token"], cfg["chat_id"], "\n".join(lines), cfg["dry"])
+            sent.append(pkey)
+            print(f"[f1] anteprima inviata: {race['name']}")
+        # promemoria: F1_REMIND_MIN minuti prima di ogni sessione
+        for s in sess:
+            skey = f"{race['id']}:{s['key']}"
+            left = s["ts"] - now
+            if 0 < left <= F1_REMIND_MIN * 60 and skey not in sent:
+                d = datetime.fromtimestamp(s["ts"], ROME)
+                send_telegram(cfg["token"], cfg["chat_id"],
+                              f"🚦 <b>{s['label']} tra {int(left // 60) + 1} min</b>\n"
+                              f"{html.escape(race['name'])} · ore {d:%H:%M} (ora italiana)", cfg["dry"])
+                sent.append(skey)
+                print(f"[f1] promemoria inviato: {race['name']} {s['label']}")
+    state["f1_sent"] = sent[-60:]
+
+
+# ---------------------------------------------------------------- pausa weekend
+QUIET_FROM = (4, 23)    # venerdì ore 23:00 (ora italiana)
+QUIET_TO = (6, 22)      # domenica ore 22:00: poi arriva il recap
+RECAP_TOP = 8
+
+
+def in_quiet(now=None):
+    d = datetime.fromtimestamp(now or time.time(), ROME)
+    return QUIET_FROM <= (d.weekday(), d.hour) < QUIET_TO
+
+
+def weekend_recap(cfg, state, now=None):
+    """Domenica dalle 22:00 (fino a mezzanotte): una sola volta, le news più impattanti trattenute nel weekend."""
+    now = now or time.time()
+    d = datetime.fromtimestamp(now, ROME)
+    key = d.date().isoformat()
+    if d.weekday() != 6 or d.hour < QUIET_TO[1] or key in state.setdefault("recap_sent", []):
+        return
+    top = []
+    for x in sorted((x for x in state["weekend"] if x.get("t", 0) > now - 48 * 3600),
+                    key=lambda x: (-x.get("score", 0), x.get("t", 0))):
+        if not any(similar(x["titolo"], y["titolo"]) for y in top):      # stesso fatto raccontato più volte
+            top.append(x)
+        if len(top) == RECAP_TOP:
+            break
+    if not top:
+        text = "📰 <b>Recap del weekend</b>\nNessuna news importante da venerdì sera."
+    else:
+        lines = [f"📰 <b>Recap del weekend</b> · le {len(top)} news più impattanti", ""]
+        for n, x in enumerate(top, 1):
+            w = datetime.fromtimestamp(x["t"], ROME)
+            lines.append(f"{n}. {'🚨' if x['score'] >= 9 else '⚠️'} <b>{html.escape(x['titolo'])}</b>")
+            lines.append(f"<i>{GIORNI[w.weekday()]} {w:%H:%M} · {html.escape(x['source'])} · impatto {x['score']}/10</i>")
+            if x.get("cosa"):
+                lines.append(html.escape(x["cosa"][:220]))
+            if x.get("link"):
+                lines.append(f'<a href="{html.escape(x["link"], quote=True)}">Fonte</a>')
+            lines.append("")
+        text = "\n".join(lines).strip()
+        if len(text) > 4000:
+            text = text[:3990].rsplit("\n", 1)[0] + "\n…"
+    send_telegram(cfg["token"], cfg["chat_id"], text, cfg["dry"])
+    state["recap_sent"] = (state["recap_sent"] + [key])[-10:]
+    state["weekend"] = []
+    print(f"[weekend] recap inviato: {len(top)} news")
+
+
 # ---------------------------------------------------------------- main
 def is_dup(title, sent):
     recent = [x for x in sent if x.get("t", 0) > time.time() - 6 * 3600]
@@ -494,8 +629,15 @@ def run_once(cfg, state):
         if ev.get("doppione") is True:
             print(f"[dup-AI {score}/10] {i['source']}: {i['title'][:90]}  =  {str(ev.get('doppione_di', ''))[:90]}")
             continue
+        titolo = ev.get("titolo") or i["title"][:150]
+        if in_quiet():      # pausa weekend: niente messaggio, la news va nel recap di domenica sera
+            state["weekend"].append({"t": time.time(), "titolo": titolo, "cosa": ev.get("cosa", ""),
+                                     "score": score, "source": i["source"], "link": i["link"]})
+            state["sent"].append({"t": time.time(), "titolo": titolo, "orig": i["title"][:200], "storia": storia})
+            print(f"[weekend] trattenuta {score}/10 {i['title'][:90]}")
+            continue
         send_telegram(cfg["token"], cfg["chat_id"], format_msg(i, ev), cfg["dry"])
-        state["sent"].append({"t": time.time(), "titolo": ev.get("titolo") or i["title"][:150],
+        state["sent"].append({"t": time.time(), "titolo": titolo,
                               "orig": i["title"][:200], "storia": storia})
         print(f"[sent] {score}/10 {i['title'][:90]}")
 
@@ -544,6 +686,14 @@ def main():
             run_once(cfg, state)
         except Exception as e:
             print(f"[err] {e}", file=sys.stderr)
+        try:
+            f1_check(cfg, state)
+        except Exception as e:
+            print(f"[err] F1: {e}", file=sys.stderr)
+        try:
+            weekend_recap(cfg, state)
+        except Exception as e:
+            print(f"[err] recap: {e}", file=sys.stderr)
         save_state(cfg["state"], state)
         if not a.loop:
             break
