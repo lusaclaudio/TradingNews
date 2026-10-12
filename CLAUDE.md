@@ -3,12 +3,12 @@
 Contesto per Claude Code. Il progetto è nato in una conversazione Cowork (settembre-ottobre 2026); questo file ne riassume decisioni, stato e prossimi passi.
 
 ## Utente
-- Claudio, retail trader di futures (ES, NQ, YM, FDAX). Scrive in **italiano**; preferisce risposte concise e concrete, e contesta subito le risposte fuori bersaglio.
+- Scrive in **italiano**; preferisce risposte concise e concrete, e contesta subito le risposte fuori bersaglio.
 - Non è uno sviluppatore: aggiorna il bot caricando i file a mano su GitHub (Add file → Upload files), poi fa Cancel workflow + Run workflow. Le istruzioni vanno date passo per passo e bisogna consegnare **file completi**, non diff.
 - **Verificare sempre i fatti attuali** (ruoli, modelli AI, URL) con una ricerca, invece di andare a memoria. È già capitato un errore: Powell indicato come presidente Fed quando dal 22/05/2026 il presidente è Kevin Warsh.
 
 ## Cosa fa
-Bot Telegram che invia a Claudio le **breaking news che muovono il mercato** (Trump, geopolitica, sanzioni/dazi, Fed/BCE, macro, AI/semiconduttori), con riassunto in italiano, sezione "Perché conta" e asset coinvolti.
+Bot Telegram che invia all'utente le **breaking news che muovono il mercato** (Trump, geopolitica, sanzioni/dazi, Fed/BCE, macro, AI/semiconduttori), con riassunto in italiano, sezione "Perché conta" e asset coinvolti.
 
 ## Deploy
 - Repo GitHub **pubblico** `lusaclaudio/TradingNews`. È pubblico perché i minuti di Actions dei repo privati non bastano, quindi anche i **log sono pubblici**: non stampare mai dati privati.
@@ -56,12 +56,12 @@ python bot.py --test --dry-run
 - Run falliti per "job not acquired by Runner": problema di GitHub, non del bot.
 
 ## Idee in sospeso (non implementate)
-- **Chat con il bot**: Claudio risponde a una news su Telegram e l'AI gli risponde.
+- **Chat con il bot**: l'utente risponde a una news su Telegram e l'AI gli risponde.
   - Piano: sostituire `time.sleep` con il long-polling `getUpdates` e salvare `offset` nello stato; mappare `reply_to_message.message_id` sulla news inviata (salvare `message_id` in `sent`); tenere un breve storico della conversazione per news; dare come contesto le news delle ultime ore.
   - Vincoli: rispondere **solo** a `TELEGRAM_CHAT_ID`; non loggare il testo delle domande (log pubblici).
   - Limiti: buchi di 30-60 s tra un run e l'altro (i messaggi restano in coda su Telegram fino a 24 h); l'AI non conosce i prezzi live.
   - Opzionali: grounding con Google Search di Gemini, prezzi live, comandi `/muto 1h`, `/soglia 9`, `/ultime`.
-  - Claudio non ha ancora scelto la versione base o quella completa.
+  - L'utente non ha ancora scelto la versione base o quella completa.
 - Verificare il ritardo dei canali Telegram rispetto agli originali su X.
 - Alternativa all'hosting: VPS o PC sempre acceso (eliminerebbe i buchi tra i run e i fallimenti dei runner GitHub).
 - Aggiornare `CONTESTO` quando Lagarde lascerà la BCE (2027).
